@@ -25,8 +25,16 @@
 #
 # { "groups": ["utility", "databases"], "a": false, "b": true }
 
+# Updated 2023
+#
+# Added error handling
+# Added Windows os name normalization
+# Ignored local, APIPA, and 172.0.0.0/16 IP addresses
+# Fixed version detection logic for Proxmox VE >= 8.0.0
+
 from six.moves.urllib import request, parse, error
 
+import ast
 try:
     import json
 except ImportError:
@@ -35,6 +43,7 @@ import os
 import sys
 import socket
 import re
+import time
 from optparse import OptionParser
 
 from six import iteritems
@@ -88,7 +97,12 @@ class ProxmoxPoolList(list):
 
 class ProxmoxVersion(dict):
     def get_version(self):
-        return float(self['version'].split('.')[0])
+        # Handle versions with `-` in them (works on versions without as well)
+        version = self['version'].split('-')[0]
+        if len(version.split('.')) > 2:
+            return float('.'.join(version.split('.')[0:2]))
+        else:
+            return float(self['version'])
 
 
 class ProxmoxPool(dict):
@@ -120,60 +134,40 @@ class ProxmoxAPI(object):
                             options.password = config_data["password"]
                         except KeyError:
                             options.password = None
-                    if not options.token:
-                        try:
-                            options.token = config_data["token"]
-                        except KeyError:
-                            options.token = None
-                    if not options.secret:
-                        try:
-                            options.secret = config_data["secret"]
-                        except KeyError:
-                            options.secret = None
-                    if not options.include:
-                        options.include = config_data["include"]
-                    if not options.exclude:
-                        options.exclude = config_data["exclude"]
 
         if not options.url:
             raise Exception('Missing mandatory parameter --url (or PROXMOX_URL or "url" key in config file).')
         elif not options.username:
             raise Exception(
                 'Missing mandatory parameter --username (or PROXMOX_USERNAME or "username" key in config file).')
-        elif not options.password and (not options.token or not options.secret):
+        elif not options.password:
             raise Exception(
-                'Missing mandatory parameter --password (or PROXMOX_PASSWORD or "password" key in config file) or alternatively --token and --secret (or PROXMOX_TOKEN and PROXMOX_SECRET or "token" and "secret" key in config file).')
-
+                'Missing mandatory parameter --password (or PROXMOX_PASSWORD or "password" key in config file).')
+        
         # URL should end with a trailing slash
         if not options.url.endswith("/"):
             options.url = options.url + "/"
 
     def auth(self):
-        if not self.options.token or not self.options.secret:
-            request_path = '{0}api2/json/access/ticket'.format(self.options.url)
+        request_path = '{0}api2/json/access/ticket'.format(self.options.url)
 
-            request_params = parse.urlencode({
-                'username': self.options.username,
-                'password': self.options.password,
-            })
+        request_params = parse.urlencode({
+            'username': self.options.username,
+            'password': self.options.password,
+        })
 
-            data = json.load(open_url(request_path, data=request_params,
-                                    validate_certs=self.options.validate))
+        data = json.load(open_url(request_path, data=request_params,
+                                  validate_certs=self.options.validate))
 
-            self.credentials = {
-                'ticket': data['data']['ticket'],
-                'CSRFPreventionToken': data['data']['CSRFPreventionToken'],
-            }
+        self.credentials = {
+            'ticket': data['data']['ticket'],
+            'CSRFPreventionToken': data['data']['CSRFPreventionToken'],
+        }
 
     def get(self, url, data=None):
         request_path = '{0}{1}'.format(self.options.url, url)
 
-        headers = {}
-        if not self.options.token or not self.options.secret:
-            headers['Cookie'] = 'PVEAuthCookie={0}'.format(self.credentials['ticket'])
-        else:
-            headers['Authorization'] = 'PVEAPIToken={0}!{1}={2}'.format(self.options.username, self.options.token, self.options.secret)
-        
+        headers = {'Cookie': 'PVEAuthCookie={0}'.format(self.credentials['ticket'])}
         request = open_url(request_path, data=data, headers=headers,
                            validate_certs=self.options.validate)
 
@@ -232,21 +226,6 @@ class ProxmoxAPI(object):
             return ip_address
         except:
             return False
-
-### PATCH for LXC HOSTNAME 
-### GET HOSTNAME for LXC-Containers
-
-    def lxc_hostname(self, node, vm):
-        try:
-            config = self.get('api2/json/nodes/{0}/lxc/{1}/config'.format(node, vm))
-        except HTTPError:
-            return False
-        
-        try:
-            hostname = config['hostname']
-            return hostname
-        except:
-            return False
     
     def version(self):
         return ProxmoxVersion(self.get('api2/json/version'))
@@ -256,7 +235,10 @@ class ProxmoxAPI(object):
         osinfo = self.get('api2/json/nodes/{0}/qemu/{1}/agent/get-osinfo'.format(node, vm))['result']
         if osinfo:
             if 'id' in osinfo:
-                system_info.id = osinfo['id']
+                if osinfo['id'] == 'mswindows':
+                    system_info.id = 'windows'
+                else:
+                    system_info.id = osinfo['id']
 
             if 'name' in osinfo:
                 system_info.name = osinfo['name']
@@ -271,49 +253,41 @@ class ProxmoxAPI(object):
                 system_info.version_id = osinfo['version-id']
 
         ip_address = None
-        networks = self.get('api2/json/nodes/{0}/qemu/{1}/agent/network-get-interfaces'.format(node, vm))['result']
-        
+        try:
+            networks = self.get('api2/json/nodes/{0}/qemu/{1}/agent/network-get-interfaces'.format(node, vm))['result']
+        except HTTPError:
+            time.sleep(0.5) # sometimes this fails, so sleep a little and try again?
+            try:
+                networks = self.get('api2/json/nodes/{0}/qemu/{1}/agent/network-get-interfaces'.format(node, vm))['result']
+            except HTTPError:
+                networks = None # If a second try doesn't work, fail gracefully
         if networks:
             if type(networks) is dict:
                 for network in networks:
-                    if self.valid_network_interface(network):
-                        for ip_address in network['ip-address']:
-                            try:
-                                # IP address validation
-                                if ip_address['ip-address'] != '127.0.0.1' and socket.inet_aton(ip_address['ip-address']):
+                    for ip_address in ['ip-address']:
+                        try:
+                            # IP address validation
+                            if socket.inet_aton(ip_address):
+                                # Ignore localhost, APIPA, and any 172 (docker) address
+                                if ip_address != '127.0.0.1' and not re.search(r'^169\.254\.\d{1,3}\.\d{1,3}', ip_address) and not re.search(r'^172\.\d{1,3}\.\d{1,3}\.\d{1,3}', ip_address):
                                     system_info.ip_address = ip_address
-                            except socket.error:
-                                pass
+                        except socket.error:
+                            pass
             elif type(networks) is list:
                 for network in networks:
-                    if self.valid_network_interface(network):
+                    if 'ip-addresses' in network:
                         for ip_address in network['ip-addresses']:
                             try:
-                                if ip_address['ip-address'] != '127.0.0.1' and socket.inet_aton(ip_address['ip-address']):
-                                    system_info.ip_address = ip_address['ip-address']
+                                # IP address validation
+                                if socket.inet_aton(ip_address['ip-address']):
+                                    # Ignore localhost, APIPA, and any 172 (docker) address
+                                    if ip_address['ip-address'] != '127.0.0.1' and not re.search(r'^169\.254\.\d{1,3}\.\d{1,3}', ip_address['ip-address']) and not re.search(r'^172\.\d{1,3}\.\d{1,3}\.\d{1,3}', ip_address['ip-address']):
+                                        system_info.ip_address = ip_address['ip-address']
                             except socket.error:
                                 pass
 
         return system_info
 
-    def valid_network_interface(self, network):
-        if 'ip-addresses' not in network:
-            return False
-        
-        # Include/Exclude are mutally exclusive
-        if len(self.options.include) > 0:
-            for regex in self.options.include:
-                if re.match(regex, network["name"]):
-                    return True
-            return False
-        
-        if len(self.options.exclude) > 0:
-            for regex in self.options.exclude:
-                if re.match(regex, network["name"]):
-                    return False
-            return True
-        
-        return True
 
 class SystemInfo(object):
     id = ""
@@ -382,27 +356,40 @@ def main_list(options, config_path):
             except TypeError:
                 metadata = {}
             except ValueError:
-                metadata = {
-                    'notes': description
-                }
+                try:
+                    metadata = ast.literal_eval(description) # This is SUPER YOLO, but the docs say "Safely evaluate an expression" so...  ¯\_(ツ)_/¯
+                except TypeError:
+                    metadata = {}
+                except ValueError:
+                    metadata = {
+                        'notes': description
+                    }
+                except SyntaxError:
+                    metadata = {
+                        'notes': description
+                    }
             
             if type == 'qemu':
                 # Retrieve information from QEMU agent if installed
                 if proxmox_api.qemu_agent(node, vmid):
-                    system_info = proxmox_api.qemu_agent_info(node, vmid)
+                    try:
+                        system_info = proxmox_api.qemu_agent_info(node, vmid)
+                    except Exception as e:
+                        time.sleep(2)
+                        system_info = proxmox_api.qemu_agent_info(node, vmid)
                     results['_meta']['hostvars'][vm]['ansible_host'] = system_info.ip_address
-                    results['_meta']['hostvars'][vm]['proxmox_os_id'] = system_info.id
+                    # Pull macos from VM name since macOS doesn't have QEMU guest agent support
+                    if system_info.id == '' and 'macos' in results['_meta']['hostvars'][vm]['proxmox_name'].lower():
+                        results['_meta']['hostvars'][vm]['proxmox_os_id'] = 'macos'
+                    else:
+                        results['_meta']['hostvars'][vm]['proxmox_os_id'] = system_info.id
                     results['_meta']['hostvars'][vm]['proxmox_os_name'] = system_info.name
                     results['_meta']['hostvars'][vm]['proxmox_os_machine'] = system_info.machine
                     results['_meta']['hostvars'][vm]['proxmox_os_kernel'] = system_info.kernel
                     results['_meta']['hostvars'][vm]['proxmox_os_version_id'] = system_info.version_id
             else:
-             # IF IP is empty (due DHCP, take hostname instead)
-                if proxmox_api.openvz_ip_address(node, vm) != False:
-                    results['_meta']['hostvars'][vm]['ansible_host'] = proxmox_api.openvz_ip_address(node, vmid)
-                else:
-                    results['_meta']['hostvars'][vm]['ansible_host'] = proxmox_api.lxc_hostname(node, vmid)
-
+                results['_meta']['hostvars'][vm]['ansible_host'] = proxmox_api.openvz_ip_address(node, vmid)
+            
             if 'groups' in metadata:
                 # print metadata
                 for group in metadata['groups']:
@@ -431,21 +418,6 @@ def main_list(options, config_path):
                         }
                     results[osid]['hosts'] += [vm]
 
-            # Create group 'based on proxmox_tags'
-            # so you can: --limit 'worker,external-datastore'
-            try:
-                tags = results['_meta']['hostvars'][vm]['proxmox_tags']
-                vm_name = results['_meta']['hostvars'][vm]['proxmox_name']
-                tag_list = split_tags(tags)
-                for i in range(len(tag_list)):
-                    if tag_list[i] not in results:
-                        results[tag_list[i]] = {
-                            'hosts': []
-                        }
-                    results[tag_list[i]]['hosts'] += [vm]
-            except KeyError:
-                pass
-           
             results['_meta']['hostvars'][vm].update(metadata)
 
     # pools
@@ -453,14 +425,9 @@ def main_list(options, config_path):
         results[pool] = {
             'hosts': proxmox_api.pool(pool).get_members_name(),
         }
+
     return results
 
-def split_tags(proxmox_tags: str) -> list[str]:
-    """
-    Splits proxmox_tags delimited by comma and returns a list of the tags.
-    """
-    tags = proxmox_tags.split(';')
-    return tags
 
 def main_host(options, config_path):
     proxmox_api = ProxmoxAPI(options, config_path)
@@ -498,12 +465,8 @@ def main():
     parser.add_option('--url', default=os.environ.get('PROXMOX_URL'), dest='url')
     parser.add_option('--username', default=os.environ.get('PROXMOX_USERNAME'), dest='username')
     parser.add_option('--password', default=os.environ.get('PROXMOX_PASSWORD'), dest='password')
-    parser.add_option('--token', default=os.environ.get('PROXMOX_TOKEN'), dest='token')
-    parser.add_option('--secret', default=os.environ.get('PROXMOX_SECRET'), dest='secret')
     parser.add_option('--pretty', action="store_true", default=False, dest='pretty')
     parser.add_option('--trust-invalid-certs', action="store_false", default=bool_validate_cert, dest='validate')
-    parser.add_option('--include', action="append", default=[])
-    parser.add_option('--exclude', action="append", default=[])
     (options, args) = parser.parse_args()
 
     if options.list:
@@ -517,7 +480,7 @@ def main():
     indent = None
     if options.pretty:
         indent = 2
-#TODO
+
     print((json.dumps(data, indent=indent)))
 
 
