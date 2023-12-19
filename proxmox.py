@@ -29,7 +29,7 @@
 #
 # Added error handling
 # Added Windows os name normalization
-# Ignored local, APIPA, and 172.0.0.0/16 IP addresses
+# Ignored local, APIPA, 192.168.0.0/16, and 172.0.0.0/8 IP addresses
 # Fixed version detection logic for Proxmox VE >= 8.0.0
 
 from six.moves.urllib import request, parse, error
@@ -268,8 +268,8 @@ class ProxmoxAPI(object):
                         try:
                             # IP address validation
                             if socket.inet_aton(ip_address):
-                                # Ignore localhost, APIPA, and any 172 (docker) address
-                                if ip_address != '127.0.0.1' and not re.search(r'^169\.254\.\d{1,3}\.\d{1,3}', ip_address) and not re.search(r'^172\.\d{1,3}\.\d{1,3}\.\d{1,3}', ip_address):
+                                # Ignore localhost, APIPA, 192.168.0.0/16, and any 172 (docker) address
+                                if ip_address != '127.0.0.1' and not re.search(r'^169\.254\.\d{1,3}\.\d{1,3}', ip_address) and not re.search(r'^172\.\d{1,3}\.\d{1,3}\.\d{1,3}', ip_address) and not re.search(r'^192\.168\.\d{1,3}\.\d{1,3}', ip_address):
                                     system_info.ip_address = ip_address
                         except socket.error:
                             pass
@@ -280,8 +280,8 @@ class ProxmoxAPI(object):
                             try:
                                 # IP address validation
                                 if socket.inet_aton(ip_address['ip-address']):
-                                    # Ignore localhost, APIPA, and any 172 (docker) address
-                                    if ip_address['ip-address'] != '127.0.0.1' and not re.search(r'^169\.254\.\d{1,3}\.\d{1,3}', ip_address['ip-address']) and not re.search(r'^172\.\d{1,3}\.\d{1,3}\.\d{1,3}', ip_address['ip-address']):
+                                    # Ignore localhost, APIPA, 192.168.0.0/16, and any 172 (docker) address
+                                    if ip_address['ip-address'] != '127.0.0.1' and not re.search(r'^169\.254\.\d{1,3}\.\d{1,3}', ip_address['ip-address']) and not re.search(r'^172\.\d{1,3}\.\d{1,3}\.\d{1,3}', ip_address['ip-address']) and not re.search(r'^192\.168\.\d{1,3}\.\d{1,3}', ip_address['ip-address']):
                                         system_info.ip_address = ip_address['ip-address']
                             except socket.error:
                                 pass
